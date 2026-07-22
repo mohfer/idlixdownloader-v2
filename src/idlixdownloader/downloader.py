@@ -6,14 +6,11 @@ Downloads videos from z2.idlixku.com
 
 import os
 import sys
-import json
 import re
 import time
-import glob
 import subprocess
 import cloudscraper
-from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from playwright.sync_api import sync_playwright
@@ -28,7 +25,7 @@ class MajorPlayDownloader:
         self.video_name = None
         self.config_url = None
         self.jwt_token = None
-        self.subtitle_url = None
+        self.subtitles = []  # List of subtitle URLs
 
     def get_video_info(self, url):
         """Extract video metadata from page"""
@@ -119,18 +116,23 @@ class MajorPlayDownloader:
 
         # Prompt user to select resolution
         highest_idx = variants.index(max(variants, key=lambda x: x['bandwidth']))
-        try:
-            choice = input(f"\n   Choose resolution (1-{len(variants)}, Enter for highest): ").strip()
-            if choice:
-                idx = int(choice) - 1
-                if 0 <= idx < len(variants):
-                    selected = variants[idx]
-                else:
+        selected = None
+        while selected is None:
+            try:
+                choice = input(f"\n   Choose resolution (1-{len(variants)}, Enter for highest): ").strip()
+                if not choice:
                     selected = variants[highest_idx]
-            else:
+                else:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(variants):
+                        selected = variants[idx]
+                    else:
+                        print(f"   Invalid choice. Please enter a number between 1 and {len(variants)}")
+            except ValueError:
+                print(f"   Invalid input. Please enter a number between 1 and {len(variants)}")
+            except (EOFError, KeyboardInterrupt):
                 selected = variants[highest_idx]
-        except (ValueError, EOFError):
-            selected = variants[highest_idx]
+                print(f"\n   Using highest resolution")
 
         print(f"   Selected: {selected['resolution']}")
 
@@ -290,13 +292,15 @@ class MajorPlayDownloader:
                     print(f"   [OK] Config URL extracted")
                     break
 
-            # Find subtitle URL
+            # Find subtitle URLs
             for req in network_data:
                 url = req.get('url', '')
                 if 'majorplay.net' in url and '.vtt' in url:
-                    self.subtitle_url = url
-                    print(f"   [OK] Subtitle URL found")
-                    break
+                    if url not in self.subtitles:  # Avoid duplicates
+                        self.subtitles.append(url)
+
+            if self.subtitles:
+                print(f"   [OK] {len(self.subtitles)} subtitle(s) found")
 
             if not self.config_url:
                 print(f"   [X] Config URL not found in capture")
@@ -308,10 +312,6 @@ class MajorPlayDownloader:
         except Exception as e:
             print(f"   [X] Error parsing captured data: {e}")
             return False
-
-    def get_subtitle_url(self):
-        """Return subtitle URL if found"""
-        return self.subtitle_url
 
     def download_segments(self, playlist_url, output_prefix):
         """Download all segments from fMP4 playlist with init segment (parallel)"""
@@ -536,16 +536,62 @@ class MajorPlayDownloader:
                 return False
 
             # Step 4/5: Check subtitles
-            subtitle_url = self.get_subtitle_url()
-            if subtitle_url:
-                print(f"[4/6] Subtitle found: Indonesian")
-                try:
-                    include_sub = input("   Include subtitle? (Y/n): ").strip().lower()
-                    if include_sub == 'n':
-                        subtitle_url = None
+            subtitle_url = None
+            if self.subtitles:
+                if len(self.subtitles) == 1:
+                    # Single subtitle - simple yes/no
+                    print(f"[4/6] Subtitle found")
+                    include_subtitle = None
+                    while include_subtitle is None:
+                        try:
+                            choice = input("   Include subtitle? (Y/n): ").strip().lower()
+                            if choice == '' or choice == 'y':
+                                include_subtitle = True
+                            elif choice == 'n':
+                                include_subtitle = False
+                            else:
+                                print("   Invalid input. Please enter 'y' for yes or 'n' for no")
+                        except (EOFError, KeyboardInterrupt):
+                            include_subtitle = True
+                            print("\n   Including subtitle")
+
+                    if include_subtitle:
+                        subtitle_url = self.subtitles[0]
+                    else:
                         print("   Subtitle skipped")
-                except (EOFError, KeyboardInterrupt):
-                    pass  # Default to including subtitle
+                else:
+                    # Multiple subtitles - numbered list selection
+                    print(f"[4/6] {len(self.subtitles)} subtitles found")
+                    print("\n   Available subtitles:")
+                    for i, sub_url in enumerate(self.subtitles):
+                        sub_label = f"Subtitle {i+1}"
+                        print(f"   {i+1}. {sub_label}")
+
+                    selected = None
+                    while selected is None:
+                        try:
+                            choice = input(f"\n   Choose subtitle (1-{len(self.subtitles)}, or 'n' to skip): ").strip().lower()
+                            if choice == 'n':
+                                selected = 'skip'
+                            elif choice:
+                                idx = int(choice) - 1
+                                if 0 <= idx < len(self.subtitles):
+                                    selected = idx
+                                else:
+                                    print(f"   Invalid choice. Please enter a number between 1 and {len(self.subtitles)}, or 'n' to skip")
+                            else:
+                                print(f"   Invalid input. Please enter a number between 1 and {len(self.subtitles)}, or 'n' to skip")
+                        except ValueError:
+                            print(f"   Invalid input. Please enter a number between 1 and {len(self.subtitles)}, or 'n' to skip")
+                        except (EOFError, KeyboardInterrupt):
+                            selected = 0
+                            print(f"\n   Using first subtitle")
+
+                    if selected == 'skip':
+                        print("   Subtitle skipped")
+                    else:
+                        subtitle_url = self.subtitles[selected]
+                        print(f"   Selected: Subtitle {selected + 1}")
 
             # Step 5/6: Download
             os.makedirs('output', exist_ok=True)

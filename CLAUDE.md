@@ -18,7 +18,7 @@ uv run idlix <video_url> <config_url>         # Manual mode: skip capture, use k
 
 **Test:**
 ```bash
-uv run python tests/test_downloader.py   # Basic import/dependency verification
+uv run python tests/test_downloader.py   # Run unit tests for downloader
 ```
 
 **Requirements:**
