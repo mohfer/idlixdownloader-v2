@@ -7,11 +7,14 @@ Video downloader for [z2.idlixku.com](https://z2.idlixku.com) with automated net
 - **Automated Network Capture** - Playwright-based browser automation with stealth techniques to bypass Cloudflare challenges
 - **Smart Interaction** - Auto-detects and clicks play buttons, handles popup ads, and automatically skips pre-roll advertisements
 - **Early Exit Optimization** - Polls for config URLs and exits early instead of waiting fixed timeouts (reduces capture time from 60s to ~10-20s)
+- **Resume Download Capability** - Save download state (resolution, subtitle, progress) and resume interrupted downloads
+- **Smart Resume Mode** - Auto-detects previous downloads and offers to continue with saved settings or start fresh
+- **Language Detection** - Automatically parses subtitle language from URL (Indonesian, English, etc.)
+- **JWT Token Resilience** - Resume works even after JWT token expires (~55 minutes) by matching subtitles by base URL
 - **Parallel Downloading** - Multi-threaded segment download (5 workers) with automatic retry logic (3 attempts per segment)
 - **Interactive Selection** - User prompts for resolution and subtitle preferences during download
 - **Proper fMP4 Assembly** - Handles init segments correctly for fragmented MP4 concatenation
-- **JWT Token Handling** - Preserves authentication tokens throughout the download pipeline (~55 minute validity)
-- **Subtitle Support** - Auto-detects and embeds Indonesian subtitles into MKV output
+- **Subtitle Support** - Auto-detects and embeds subtitles (Indonesian, English) into MKV output
 
 ## Prerequisites
 
@@ -68,6 +71,25 @@ uv run idlix "https://z2.idlixku.com/movie/..." "https://e2e.majorplay.net/.../c
 ```
 
 This skips the browser automation step and goes directly to downloading.
+
+### Resume Download
+
+If a download is interrupted, the tool automatically detects the previous download and offers to resume:
+
+```
+[!] Previous download found:
+   Resolution: 1920x1080
+   Subtitle: Indonesian Subtitle
+   Segments: 358 files
+
+   Continue previous download? (Y/n):
+```
+
+**Continue (Y)**: Resumes with saved settings (resolution and subtitle choice), skips already-downloaded segments
+
+**Fresh (n)**: Deletes old segments and metadata, starts a fresh download with new selections
+
+**Note**: Resume works even if JWT tokens have expired (>55 minutes) because the tool captures fresh tokens while matching saved subtitle preferences by base URL.
 
 ## How It Works
 

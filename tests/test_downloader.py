@@ -4,6 +4,7 @@ Comprehensive unit tests for IdlixDownloader
 Tests core functionality with mocked dependencies
 """
 
+import os
 import unittest
 from unittest.mock import Mock, patch
 from idlixdownloader import MajorPlayDownloader
@@ -283,6 +284,93 @@ class TestVideoInfo(unittest.TestCase):
             with self.assertRaises(Exception) as context:
                 self.downloader.get_video_info('https://z2.idlixku.com/movie/test')
             self.assertIn('Failed to fetch page', str(context.exception))
+
+
+class TestMetadataSystem(unittest.TestCase):
+    """Test metadata save/load functionality"""
+
+    def setUp(self):
+        self.downloader = MajorPlayDownloader()
+        self.downloader.video_name = "Test Movie"
+
+    def test_save_metadata_creates_directory(self):
+        """Test that save_metadata creates output directory if not exists"""
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Override output path temporarily
+            original_cwd = os.getcwd()
+            os.chdir(tmpdir)
+
+            try:
+                self.downloader.save_download_metadata("Test Movie", "1920x1080", None)
+                self.assertTrue(os.path.exists(os.path.join(tmpdir, "output/Test Movie")))
+                self.assertTrue(os.path.exists(os.path.join(tmpdir, "output/Test Movie/download_state.json")))
+            finally:
+                os.chdir(original_cwd)
+
+    def test_load_metadata_not_exists(self):
+        """Test loading metadata when file doesn't exist"""
+        result = self.downloader.load_download_metadata("NonexistentMovie")
+        self.assertIsNone(result)
+
+    def test_save_and_load_metadata(self):
+        """Test saving and loading metadata roundtrip"""
+        import tempfile
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            os.chdir(tmpdir)
+
+            try:
+                subtitle_info = {
+                    'url': 'https://example.com/subtitle.vtt',
+                    'name': 'English',
+                    'language': 'en'
+                }
+
+                self.downloader.save_download_metadata("Test Movie", "1920x1080", subtitle_info)
+                loaded = self.downloader.load_download_metadata("Test Movie")
+
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded['video_name'], "Test Movie")
+                self.assertEqual(loaded['resolution'], "1920x1080")
+                self.assertEqual(loaded['subtitle']['language'], 'en')
+            finally:
+                os.chdir(original_cwd)
+
+
+class TestLanguageParsing(unittest.TestCase):
+    """Test language extraction from subtitle URLs"""
+
+    def setUp(self):
+        self.downloader = MajorPlayDownloader()
+
+    def test_parse_language_indonesian(self):
+        """Test parsing Indonesian language code from URL"""
+        url = "https://e2e.majorplay.net/v/z5/abc/i18n/id/subtitle.vtt?t=token"
+        result = self.downloader.get_language_from_subtitle_url(url)
+        self.assertEqual(result, "Indonesian")
+
+    def test_parse_language_english(self):
+        """Test parsing English language code from URL"""
+        url = "https://e2e.majorplay.net/v/z5/abc/i18n/en/subtitle.vtt?t=token"
+        result = self.downloader.get_language_from_subtitle_url(url)
+        self.assertEqual(result, "English")
+
+    def test_parse_language_unknown_code(self):
+        """Test parsing unknown language code returns uppercase code"""
+        url = "https://e2e.majorplay.net/v/z5/abc/i18n/xx/subtitle.vtt?t=token"
+        result = self.downloader.get_language_from_subtitle_url(url)
+        self.assertEqual(result, "XX")
+
+    def test_parse_language_no_pattern(self):
+        """Test URL without language pattern returns None"""
+        url = "https://example.com/subtitle.vtt"
+        result = self.downloader.get_language_from_subtitle_url(url)
+        self.assertIsNone(result)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import os
 import sys
 import re
 import time
+import json
 import subprocess
 import cloudscraper
 from urllib.parse import urljoin
@@ -78,6 +79,11 @@ class MajorPlayDownloader:
         if response.status_code != 200:
             raise Exception(f"Failed to get config: {response.status_code}")
 
+        # Extract JWT token early for subtitle/playlist URLs
+        jwt_token = ''
+        if '?' in self.config_url:
+            jwt_token = '?' + self.config_url.split('?', 1)[1]
+
         # Parse M3U8 master playlist
         master_playlist = response.text
 
@@ -107,44 +113,83 @@ class MajorPlayDownloader:
                 if match:
                     audio_url = match.group(1)
 
+        # Extract subtitles from master playlist with language info
+        playlist_subs_found = 0
+        for line in master_playlist.split('\n'):
+            if 'TYPE=SUBTITLES' in line:
+                # Parse subtitle metadata: NAME, LANGUAGE, URI
+                name_match = re.search(r'NAME="([^"]+)"', line)
+                lang_match = re.search(r'LANGUAGE="([^"]+)"', line)
+                uri_match = re.search(r'URI="([^"]+)"', line)
+
+                if uri_match:
+                    # Build subtitle URL with JWT token
+                    sub_url = uri_match.group(1)
+                    if not sub_url.startswith('http'):
+                        base = self.config_url.rsplit('?', 1)[0].rsplit('/', 1)[0]
+                        sub_url = urljoin(base + '/', sub_url) + jwt_token
+
+                    subtitle_info = {
+                        'url': sub_url,
+                        'name': name_match.group(1) if name_match else 'Unknown',
+                        'language': lang_match.group(1) if lang_match else None
+                    }
+
+                    # Add if not duplicate
+                    if not any(s['url'] == subtitle_info['url'] for s in self.subtitles):
+                        self.subtitles.append(subtitle_info)
+                        playlist_subs_found += 1
+
+        if playlist_subs_found > 0:
+            print(f"   [DEBUG] Found {playlist_subs_found} subtitle(s) in master playlist")
+
         if not variants:
             raise Exception("No video variants found in config")
 
-        print(f"\n   Available resolutions:")
-        for i, v in enumerate(variants):
-            print(f"   {i+1}. {v['resolution']} ({v['bandwidth']//1000} kbps)")
-
-        # Prompt user to select resolution
-        highest_idx = variants.index(max(variants, key=lambda x: x['bandwidth']))
+        # Check if resuming with saved resolution
         selected = None
-        while selected is None:
-            try:
-                choice = input(f"\n   Choose resolution (1-{len(variants)}, Enter for highest): ").strip()
-                if not choice:
-                    selected = variants[highest_idx]
-                else:
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(variants):
-                        selected = variants[idx]
+        if hasattr(self, 'resume_mode') and self.resume_mode and hasattr(self, 'saved_resolution'):
+            for v in variants:
+                if v['resolution'] == self.saved_resolution:
+                    selected = v
+                    print(f"\n   Using saved resolution: {selected['resolution']}")
+                    break
+            if not selected:
+                print(f"\n   [!] Saved resolution {self.saved_resolution} not available, prompting for selection")
+
+        # Prompt user to select resolution if not resuming
+        if selected is None:
+            print(f"\n   Available resolutions:")
+            for i, v in enumerate(variants):
+                print(f"   {i+1}. {v['resolution']} ({v['bandwidth']//1000} kbps)")
+
+            highest_idx = variants.index(max(variants, key=lambda x: x['bandwidth']))
+            while selected is None:
+                try:
+                    choice = input(f"\n   Choose resolution (1-{len(variants)}, Enter for highest): ").strip()
+                    if not choice:
+                        selected = variants[highest_idx]
                     else:
-                        print(f"   Invalid choice. Please enter a number between 1 and {len(variants)}")
-            except ValueError:
-                print(f"   Invalid input. Please enter a number between 1 and {len(variants)}")
-            except (EOFError, KeyboardInterrupt):
-                selected = variants[highest_idx]
-                print(f"\n   Using highest resolution")
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(variants):
+                            selected = variants[idx]
+                        else:
+                            print(f"   Invalid choice. Please enter a number between 1 and {len(variants)}")
+                except ValueError:
+                    print(f"   Invalid input. Please enter a number between 1 and {len(variants)}")
+                except (EOFError, KeyboardInterrupt):
+                    selected = variants[highest_idx]
+                    print(f"\n   Using highest resolution")
 
-        print(f"   Selected: {selected['resolution']}")
+            print(f"   Selected: {selected['resolution']}")
 
-        # Extract JWT token from config URL
-        jwt_token = ''
-        if '?' in self.config_url:
-            jwt_token = '?' + self.config_url.split('?', 1)[1]
+        # Store selected resolution for metadata
+        self.selected_resolution = selected['resolution']
 
         # Construct base without query
         base = self.config_url.rsplit('?', 1)[0].rsplit('/', 1)[0]
 
-        # Build URLs with JWT token
+        # Build URLs with JWT token (already extracted earlier)
         self.video_playlist_url = urljoin(base + '/', selected['url']) + jwt_token
         self.audio_playlist_url = urljoin(base + '/', audio_url) + jwt_token if audio_url else None
 
@@ -292,12 +337,24 @@ class MajorPlayDownloader:
                     print(f"   [OK] Config URL extracted")
                     break
 
-            # Find subtitle URLs
+            # Find subtitle URLs (fallback for subtitles not in master playlist)
+            network_subs_found = 0
             for req in network_data:
                 url = req.get('url', '')
                 if 'majorplay.net' in url and '.vtt' in url:
-                    if url not in self.subtitles:  # Avoid duplicates
-                        self.subtitles.append(url)
+                    # Check if not already added from master playlist
+                    if not any(s['url'] == url for s in self.subtitles):
+                        # Extract filename for display (no language info available from network capture)
+                        filename = url.split('/')[-1].split('?')[0]
+                        self.subtitles.append({
+                            'url': url,
+                            'name': filename.replace('.vtt', ''),
+                            'language': None  # Unknown from network capture
+                        })
+                        network_subs_found += 1
+
+            if network_subs_found > 0:
+                print(f"   [DEBUG] Found {network_subs_found} subtitle(s) from network capture (no language info)")
 
             if self.subtitles:
                 print(f"   [OK] {len(self.subtitles)} subtitle(s) found")
@@ -320,6 +377,11 @@ class MajorPlayDownloader:
         if response.status_code != 200:
             raise Exception(f"Failed to fetch playlist: {response.status_code}")
 
+        # Extract JWT token from playlist URL to pass to segments
+        jwt_token = ''
+        if '?' in playlist_url:
+            jwt_token = '?' + playlist_url.split('?', 1)[1]
+
         # Parse init segment (EXT-X-MAP) and segment URLs
         init_url = None
         segments = []
@@ -330,16 +392,21 @@ class MajorPlayDownloader:
                 match = re.search(r'URI="([^"]+)"', line)
                 if match:
                     init_url = match.group(1)
-                    # Resolve relative URL
+                    # Resolve relative URL and preserve JWT token
                     if not init_url.startswith('http'):
-                        base = playlist_url.rsplit('/', 1)[0]
-                        init_url = urljoin(base + '/', init_url)
+                        base = playlist_url.rsplit('/', 1)[0].rsplit('?', 1)[0]
+                        init_url = urljoin(base + '/', init_url) + jwt_token
             elif line and not line.startswith('#'):
-                # Resolve relative segment URL
+                # Resolve segment URL and append JWT token
                 seg_url = line
                 if not seg_url.startswith('http'):
-                    base = playlist_url.rsplit('/', 1)[0]
-                    seg_url = urljoin(base + '/', seg_url)
+                    # Relative URL - resolve against base and append JWT token
+                    base = playlist_url.rsplit('/', 1)[0].rsplit('?', 1)[0]
+                    seg_url = urljoin(base + '/', seg_url) + jwt_token
+                else:
+                    # Absolute URL - append JWT token if not already present
+                    if '?' not in seg_url:
+                        seg_url = seg_url + jwt_token
                 segments.append(seg_url)
 
         if not segments:
@@ -361,10 +428,19 @@ class MajorPlayDownloader:
         def download_segment(i, seg_url, retries=3):
             seg_file = f"{output_prefix}_seg{i:04d}.m4s"
 
+            # Continue download: skip if segment already exists with content
+            if os.path.exists(seg_file) and os.path.getsize(seg_file) > 0:
+                return seg_file
+
             for attempt in range(retries):
                 try:
                     seg_response = self.scraper.get(seg_url, timeout=30)
                     if seg_response.status_code != 200:
+                        # Debug logging for 401 errors
+                        if seg_response.status_code == 401:
+                            print(f"\n   [DEBUG] Segment {i} got 401 Unauthorized")
+                            print(f"   [DEBUG] URL: {seg_url[:100]}{'...' if len(seg_url) > 100 else ''}")
+                            print(f"   [DEBUG] Has query params: {'?' in seg_url}")
                         if attempt == retries - 1:
                             raise Exception(f"Failed segment {i}: {seg_response.status_code}")
                         time.sleep(1 * (attempt + 1))
@@ -388,7 +464,9 @@ class MajorPlayDownloader:
         completed = 0
         progress_lock = Lock()
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Manually manage executor for proper Ctrl+C handling
+        executor = ThreadPoolExecutor(max_workers=5)
+        try:
             futures = {executor.submit(download_segment, i, url): i
                       for i, url in enumerate(segments, 1)}
 
@@ -403,20 +481,38 @@ class MajorPlayDownloader:
                 except Exception as e:
                     print(f"\n   [X] Error downloading segment {i}: {e}")
                     raise
+        except KeyboardInterrupt:
+            print(f"\n\n   [!] Download cancelled by user (Ctrl+C)")
+            print(f"   Progress: {completed}/{len(segments)} segments completed")
+            print(f"   Continue download will skip completed segments on next run")
+            # Don't wait for workers - cancel immediately
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            # Normal shutdown for non-interrupted case
+            if not executor._shutdown:
+                executor.shutdown(wait=True)
 
         return {'segments': segment_files, 'init_data': init_data}
 
-    def download_with_ffmpeg(self, output_file, subtitle_url=None):
+    def download_with_ffmpeg(self, output_file, subtitle_url=None, segments_dir=None):
         """Download segments then binary concat fMP4 fragments"""
         print(f"[5/6] Downloading video...")
 
         if not self.video_playlist_url:
             raise Exception("No video playlist URL")
 
+        # Use segments_dir for intermediate files if provided, otherwise use output_file directory
+        if segments_dir:
+            base_name = os.path.splitext(os.path.basename(output_file))[0]
+            segments_prefix = f"{segments_dir}/{base_name}"
+        else:
+            segments_prefix = output_file
+
         try:
             # Download video segments
             print(f"   Downloading video segments...")
-            video_data = self.download_segments(self.video_playlist_url, f"{output_file}_video")
+            video_data = self.download_segments(self.video_playlist_url, f"{segments_prefix}_video")
             video_segments = video_data['segments']
             video_init = video_data['init_data']
 
@@ -425,15 +521,16 @@ class MajorPlayDownloader:
             audio_init = None
             if self.audio_playlist_url:
                 print(f"   Downloading audio segments...")
-                audio_data = self.download_segments(self.audio_playlist_url, f"{output_file}_audio")
+                audio_data = self.download_segments(self.audio_playlist_url, f"{segments_prefix}_audio")
                 audio_segments = audio_data['segments']
                 audio_init = audio_data['init_data']
 
-            # Download subtitle
+            # Download subtitle (keep in movie directory, not segments)
             subtitle_file = None
             if subtitle_url:
                 print(f"   Downloading subtitle...")
-                subtitle_file = f"{output_file}.vtt"
+                # Strip extension from output_file to avoid .mkv.vtt
+                subtitle_file = f"{os.path.splitext(output_file)[0]}.vtt"
                 sub_response = self.scraper.get(subtitle_url)
                 if sub_response.status_code == 200:
                     with open(subtitle_file, 'wb') as f:
@@ -441,7 +538,7 @@ class MajorPlayDownloader:
 
             # Binary concat: init + frag1 + frag2 + ... = complete.mp4
             print(f"   Concatenating fMP4 fragments...")
-            video_complete = f"{output_file}_video_complete.mp4"
+            video_complete = f"{segments_prefix}_video_complete.mp4"
             with open(video_complete, 'wb') as out:
                 if video_init:
                     out.write(video_init)
@@ -452,7 +549,7 @@ class MajorPlayDownloader:
             # Binary concat audio if separate
             audio_complete = None
             if audio_segments:
-                audio_complete = f"{output_file}_audio_complete.mp4"
+                audio_complete = f"{segments_prefix}_audio_complete.mp4"
                 with open(audio_complete, 'wb') as out:
                     if audio_init:
                         out.write(audio_init)
@@ -503,6 +600,68 @@ class MajorPlayDownloader:
             print(f"\n   [X] Error: {e}")
             return False
 
+    def load_download_metadata(self, video_name):
+        """Load metadata from previous download if exists"""
+        movie_dir = f"output/{video_name}"
+        metadata_file = f"{movie_dir}/download_state.json"
+
+        if os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return None
+        return None
+
+    def save_download_metadata(self, video_name, resolution, subtitle_info):
+        """Save download metadata for resume capability"""
+        movie_dir = f"output/{video_name}"
+        metadata_file = f"{movie_dir}/download_state.json"
+
+        # Create directory if it doesn't exist
+        os.makedirs(movie_dir, exist_ok=True)
+
+        metadata = {
+            'video_name': video_name,
+            'resolution': resolution,
+            'subtitle': subtitle_info,
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        }
+
+        try:
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"   [DEBUG] Failed to save metadata: {e}")
+
+    def get_language_from_subtitle_url(self, url):
+        """Extract language name from subtitle URL path (e.g., /i18n/id/ -> Indonesian)"""
+        match = re.search(r'/i18n/(\w+)/', url)
+        if match:
+            lang_code = match.group(1)
+            # Map common language codes to readable names
+            lang_map = {
+                'id': 'Indonesian',
+                'en': 'English',
+                'es': 'Spanish',
+                'pt': 'Portuguese',
+                'fr': 'French',
+                'de': 'German',
+                'zh': 'Chinese',
+                'ja': 'Japanese',
+                'ko': 'Korean',
+                'ar': 'Arabic',
+                'ru': 'Russian',
+                'it': 'Italian',
+                'nl': 'Dutch',
+                'pl': 'Polish',
+                'tr': 'Turkish',
+                'vi': 'Vietnamese',
+                'th': 'Thai',
+            }
+            return lang_map.get(lang_code, lang_code.upper())
+        return None
+
     def download(self, url, config_url=None, auto_extract=True):
         """Main download flow"""
         self.config_url = config_url
@@ -531,16 +690,118 @@ class MajorPlayDownloader:
                 if not self.get_session_media():
                     return False
 
+            # Check for existing download to offer resume
+            self.resume_mode = False
+            metadata = self.load_download_metadata(self.video_name)
+            if metadata:
+                movie_dir = f"output/{self.video_name}"
+                segments_dir = f"{movie_dir}/segments"
+                if os.path.exists(segments_dir):
+                    segment_count = len([f for f in os.listdir(segments_dir) if f.endswith('.m4s')])
+                    print(f"\n[!] Previous download found:")
+                    print(f"   Resolution: {metadata.get('resolution', 'unknown')}")
+                    sub_info = metadata.get('subtitle')
+                    if sub_info:
+                        # Display subtitle with language parsing from URL
+                        if sub_info.get('language'):
+                            sub_display = f"{sub_info['name']} ({sub_info['language']})"
+                        elif sub_info.get('name') != 'Unknown' and len(sub_info.get('name', '')) >= 16 and sub_info.get('name', '').replace('-', '').replace('_', '').isalnum():
+                            # Hash-like filename - try to extract language from URL
+                            lang_from_url = self.get_language_from_subtitle_url(sub_info.get('url', ''))
+                            if lang_from_url:
+                                sub_display = f"{lang_from_url} Subtitle"
+                            else:
+                                sub_display = sub_info.get('name', 'Unknown')
+                        else:
+                            sub_display = sub_info.get('name', 'Unknown')
+                        print(f"   Subtitle: {sub_display}")
+                    else:
+                        print(f"   Subtitle: none")
+                    print(f"   Segments: {segment_count} files")
+
+                    choice = None
+                    while choice is None:
+                        try:
+                            response = input("\n   Continue previous download? (Y/n): ").strip().lower()
+                            if response == '' or response == 'y':
+                                choice = 'continue'
+                            elif response == 'n':
+                                choice = 'fresh'
+                            else:
+                                print("   Invalid input. Please enter 'y' or 'n'")
+                        except (EOFError, KeyboardInterrupt):
+                            choice = 'continue'
+                            print("\n   Continuing with previous settings")
+
+                    if choice == 'continue':
+                        self.resume_mode = True
+                        self.saved_resolution = metadata.get('resolution')
+                        self.saved_subtitle = metadata.get('subtitle')
+                        print(f"   [OK] Resuming with saved settings")
+                    elif choice == 'fresh':
+                        # Delete old segments and metadata for fresh start
+                        import shutil
+                        if os.path.exists(segments_dir):
+                            shutil.rmtree(segments_dir)
+                            print(f"   [OK] Deleted {segment_count} old segments")
+
+                        metadata_file = f"{movie_dir}/download_state.json"
+                        if os.path.exists(metadata_file):
+                            os.remove(metadata_file)
+
             # Step 3/4: Get config playlist
             if not self.get_config_playlist():
                 return False
 
             # Step 4/5: Check subtitles
             subtitle_url = None
+            subtitle_handled_by_resume = False  # Flag to skip prompting when resume mode handles it
+
             if self.subtitles:
-                if len(self.subtitles) == 1:
+                # Check if resuming with saved subtitle choice
+                if hasattr(self, 'resume_mode') and self.resume_mode and hasattr(self, 'saved_subtitle'):
+                    if self.saved_subtitle is not None:
+                        # Try to find and auto-select saved subtitle
+                        # Match by base URL (ignore JWT token in query params)
+                        saved_base_url = self.saved_subtitle.get('url', '').split('?')[0]
+                        for sub_info in self.subtitles:
+                            sub_base_url = sub_info['url'].split('?')[0]
+                            if sub_base_url == saved_base_url:
+                                subtitle_url = sub_info['url']  # Use fresh URL with new JWT
+                                sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else 'Subtitle'
+                                if sub_info['language']:
+                                    sub_display = f"{sub_display} ({sub_info['language']})"
+                                print(f"[4/6] Using saved subtitle: {sub_display}")
+                                subtitle_handled_by_resume = True
+                                break
+                        if not subtitle_handled_by_resume:
+                            print(f"[4/6] Saved subtitle not available, prompting for selection")
+                    else:
+                        # saved_subtitle is None - user previously chose no subtitle
+                        print(f"[4/6] Skipping subtitle (previous choice: none)")
+                        subtitle_handled_by_resume = True
+
+                # Prompt for subtitle selection if not handled by resume mode
+                if not subtitle_handled_by_resume and len(self.subtitles) == 1:
                     # Single subtitle - simple yes/no
-                    print(f"[4/6] Subtitle found")
+                    # Show language name instead of hash filename
+                    sub_info = self.subtitles[0]
+                    print(f"   [DEBUG] Subtitle info: name='{sub_info['name']}', language={sub_info['language']}, name_len={len(sub_info['name'])}")
+                    # Use friendly name for fallback subtitles (from network capture without language info)
+                    if sub_info['language']:
+                        sub_display = f"{sub_info['name']} ({sub_info['language']})"
+                    elif sub_info['name'] != 'Unknown' and len(sub_info['name']) >= 16 and sub_info['name'].replace('-', '').replace('_', '').isalnum():
+                        # Hash-like filename - try to extract language from URL
+                        lang_from_url = self.get_language_from_subtitle_url(sub_info['url'])
+                        if lang_from_url:
+                            print(f"   [DEBUG] Detected hash-like filename, parsed language from URL: {lang_from_url}")
+                            sub_display = f"{lang_from_url} Subtitle"
+                        else:
+                            print(f"   [DEBUG] Detected hash-like filename, no language in URL")
+                            sub_display = "Subtitle"
+                    else:
+                        sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else 'Subtitle'
+                    print(f"[4/6] Subtitle found: {sub_display}")
                     include_subtitle = None
                     while include_subtitle is None:
                         try:
@@ -551,21 +812,32 @@ class MajorPlayDownloader:
                                 include_subtitle = False
                             else:
                                 print("   Invalid input. Please enter 'y' for yes or 'n' for no")
-                        except (EOFError, KeyboardInterrupt):
+                        except EOFError:
                             include_subtitle = True
                             print("\n   Including subtitle")
 
                     if include_subtitle:
-                        subtitle_url = self.subtitles[0]
+                        subtitle_url = sub_info['url']
                     else:
                         print("   Subtitle skipped")
-                else:
+                elif not subtitle_handled_by_resume:
                     # Multiple subtitles - numbered list selection
                     print(f"[4/6] {len(self.subtitles)} subtitles found")
                     print("\n   Available subtitles:")
-                    for i, sub_url in enumerate(self.subtitles):
-                        sub_label = f"Subtitle {i+1}"
-                        print(f"   {i+1}. {sub_label}")
+                    for i, sub_info in enumerate(self.subtitles):
+                        # Show language name instead of hash filename
+                        if sub_info['language']:
+                            sub_display = f"{sub_info['name']} ({sub_info['language']})"
+                        elif sub_info['name'] != 'Unknown' and len(sub_info['name']) >= 16 and sub_info['name'].replace('-', '').replace('_', '').isalnum():
+                            # Hash-like filename - try to extract language from URL
+                            lang_from_url = self.get_language_from_subtitle_url(sub_info['url'])
+                            if lang_from_url:
+                                sub_display = f"{lang_from_url} Subtitle"
+                            else:
+                                sub_display = f"Subtitle {i+1}"
+                        else:
+                            sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else f"Subtitle {i+1}"
+                        print(f"   {i+1}. {sub_display}")
 
                     selected = None
                     while selected is None:
@@ -583,20 +855,43 @@ class MajorPlayDownloader:
                                 print(f"   Invalid input. Please enter a number between 1 and {len(self.subtitles)}, or 'n' to skip")
                         except ValueError:
                             print(f"   Invalid input. Please enter a number between 1 and {len(self.subtitles)}, or 'n' to skip")
-                        except (EOFError, KeyboardInterrupt):
+                        except EOFError:
                             selected = 0
                             print(f"\n   Using first subtitle")
 
                     if selected == 'skip':
                         print("   Subtitle skipped")
                     else:
-                        subtitle_url = self.subtitles[selected]
-                        print(f"   Selected: Subtitle {selected + 1}")
+                        sub_info = self.subtitles[selected]
+                        subtitle_url = sub_info['url']
+                        # Show selected subtitle name
+                        sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else f"Subtitle {selected + 1}"
+                        if sub_info['language']:
+                            sub_display = f"{sub_display} ({sub_info['language']})"
+                        print(f"   Selected: {sub_display}")
+
+            # Save metadata for resume capability (only in normal mode, not resume mode)
+            if not hasattr(self, 'resume_mode') or not self.resume_mode:
+                # Find subtitle info if subtitle was selected
+                subtitle_info = None
+                if subtitle_url:
+                    for sub in self.subtitles:
+                        if sub['url'] == subtitle_url:
+                            subtitle_info = sub.copy()  # Make a copy so we don't modify the original
+                            # Parse language from URL if not already set
+                            if not subtitle_info.get('language'):
+                                lang_from_url = self.get_language_from_subtitle_url(subtitle_info['url'])
+                                if lang_from_url:
+                                    subtitle_info['language'] = lang_from_url
+                            break
+                self.save_download_metadata(self.video_name, self.selected_resolution, subtitle_info)
 
             # Step 5/6: Download
-            os.makedirs('output', exist_ok=True)
-            output = f"output/{self.video_name}.mp4"
-            if not self.download_with_ffmpeg(output, subtitle_url):
+            movie_dir = f"output/{self.video_name}"
+            segments_dir = f"{movie_dir}/segments"
+            os.makedirs(segments_dir, exist_ok=True)
+            output = f"{movie_dir}/{self.video_name}.mkv"
+            if not self.download_with_ffmpeg(output, subtitle_url, segments_dir):
                 return False
 
             print(f"\n[6/6] Done!")
