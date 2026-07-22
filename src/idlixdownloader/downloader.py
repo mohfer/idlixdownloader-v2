@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MajorPlay Video Downloader
-Downloads videos from z2.idlixku.com
+Downloads videos from IDLIX
 """
 
 import os
@@ -906,7 +906,7 @@ class MajorPlayDownloader:
 def main():
     print("=" * 60)
     print("   MajorPlay Video Downloader")
-    print("   Downloads videos from z2.idlixku.com")
+    print("   Downloads videos from IDLIX")
     print("=" * 60 + "\n")
 
     if len(sys.argv) < 2:

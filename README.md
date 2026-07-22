@@ -1,6 +1,6 @@
 # IdlixDownloader v2
 
-Video downloader for [z2.idlixku.com](https://z2.idlixku.com) with automated network capture and parallel segment downloading.
+Video downloader for [IDLIX](https://z2.idlixku.com) with automated network capture and parallel segment downloading.
 
 ## Features
 

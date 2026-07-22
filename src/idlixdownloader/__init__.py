@@ -1,4 +1,4 @@
-"""IdlixDownloader v2 - Video downloader for z2.idlixku.com"""
+"""IdlixDownloader v2 - Video downloader for IDLIX"""
 
 __version__ = "2.0.0"
 

@@ -1,7 +1,7 @@
 [project]
 name = "idlixdownloader"
 version = "2.0.0"
-description = "Video downloader for z2.idlixku.com with automated network capture and parallel segment downloading"
+description = "Video downloader for IDLIX with automated network capture and parallel segment downloading"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
