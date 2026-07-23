@@ -22,10 +22,8 @@ class MajorPlayDownloader:
             browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
         )
         self.base_url = "https://z2.idlixku.com/"
-        self.video_id = None
         self.video_name = None
         self.config_url = None
-        self.jwt_token = None
         self.subtitles = []  # List of subtitle URLs
 
     def get_video_info(self, url):
@@ -36,11 +34,6 @@ class MajorPlayDownloader:
         if response.status_code != 200:
             raise Exception(f"Failed to fetch page: {response.status_code}")
 
-        # Extract video ID
-        match = re.search(r'data-postid="(\d+)"', response.text)
-        if match:
-            self.video_id = match.group(1)
-
         # Extract title
         match = re.search(r'<meta itemprop="name" content="([^"]+)"', response.text)
         if match:
@@ -50,18 +43,6 @@ class MajorPlayDownloader:
             self.video_name = url.rstrip('/').split('/')[-1]
 
         print(f"   Video: {self.video_name}")
-        return True
-
-    def get_session_media(self):
-        """Get session media (skip ad)"""
-        print(f"[2/6] Getting session media...")
-
-        response = self.scraper.get(f"{self.base_url}api/watch/session/media")
-        if response.status_code != 200:
-            raise Exception(f"Failed to get session media: {response.status_code}")
-
-        # Response is VAST XML with ad - we can skip this
-        print(f"   Ad detected (skipping)")
         return True
 
     def get_config_playlist(self):
@@ -99,7 +80,6 @@ class MajorPlayDownloader:
                 variants.append({
                     'resolution': resolution,
                     'bandwidth': bandwidth,
-                    'line': line
                 })
             elif line and not line.startswith('#') and variants:
                 # This is the playlist URL for the last variant
@@ -141,32 +121,48 @@ class MajorPlayDownloader:
                         playlist_subs_found += 1
 
         if playlist_subs_found > 0:
-            print(f"   [DEBUG] Found {playlist_subs_found} subtitle(s) in master playlist")
+            print(f"   [OK] {playlist_subs_found} subtitle(s) in master playlist")
 
         if not variants:
             raise Exception("No video variants found in config")
 
-        # Check if resuming with saved resolution
+        def variant_label(v):
+            # RESOLUTION often missing on MajorPlay; bandwidth is the stable id
+            if v['resolution'] != 'unknown':
+                return f"{v['resolution']} ({v['bandwidth']//1000} kbps)"
+            return f"{v['bandwidth']//1000} kbps"
+
+        # Resume: match by bandwidth (unique). Resolution alone collides as "unknown".
         selected = None
-        if hasattr(self, 'resume_mode') and self.resume_mode and hasattr(self, 'saved_resolution'):
-            for v in variants:
-                if v['resolution'] == self.saved_resolution:
-                    selected = v
-                    print(f"\n   Using saved resolution: {selected['resolution']}")
-                    break
-            if not selected:
-                print(f"\n   [!] Saved resolution {self.saved_resolution} not available, prompting for selection")
+        if getattr(self, 'resume_mode', False):
+            saved_bw = getattr(self, 'saved_bandwidth', None)
+            if saved_bw is not None:
+                for v in variants:
+                    if v['bandwidth'] == saved_bw:
+                        selected = v
+                        print(f"\n   Using saved quality: {variant_label(selected)}")
+                        break
+            # Legacy state without bandwidth: only safe if resolution is unique & real
+            if selected is None:
+                saved_res = getattr(self, 'saved_resolution', None)
+                if saved_res and saved_res != 'unknown':
+                    matches = [v for v in variants if v['resolution'] == saved_res]
+                    if len(matches) == 1:
+                        selected = matches[0]
+                        print(f"\n   Using saved quality: {variant_label(selected)}")
+            if selected is None:
+                print(f"\n   [!] Saved quality not available, prompting for selection")
 
         # Prompt user to select resolution if not resuming
         if selected is None:
-            print(f"\n   Available resolutions:")
+            print(f"\n   Available qualities:")
             for i, v in enumerate(variants):
-                print(f"   {i+1}. {v['resolution']} ({v['bandwidth']//1000} kbps)")
+                print(f"   {i+1}. {variant_label(v)}")
 
             highest_idx = variants.index(max(variants, key=lambda x: x['bandwidth']))
             while selected is None:
                 try:
-                    choice = input(f"\n   Choose resolution (1-{len(variants)}, Enter for highest): ").strip()
+                    choice = input(f"\n   Choose quality (1-{len(variants)}, Enter for highest): ").strip()
                     if not choice:
                         selected = variants[highest_idx]
                     else:
@@ -179,12 +175,13 @@ class MajorPlayDownloader:
                     print(f"   Invalid input. Please enter a number between 1 and {len(variants)}")
                 except (EOFError, KeyboardInterrupt):
                     selected = variants[highest_idx]
-                    print(f"\n   Using highest resolution")
+                    print(f"\n   Using highest quality")
 
-            print(f"   Selected: {selected['resolution']}")
+            print(f"   Selected: {variant_label(selected)}")
 
-        # Store selected resolution for metadata
+        # Store for metadata / resume (bandwidth is the match key)
         self.selected_resolution = selected['resolution']
+        self.selected_bandwidth = selected['bandwidth']
 
         # Construct base without query
         base = self.config_url.rsplit('?', 1)[0].rsplit('/', 1)[0]
@@ -206,12 +203,6 @@ class MajorPlayDownloader:
                 'headers': request.headers
             })
 
-        def handle_response(response):
-            for req in requests:
-                if req['url'] == response.url and 'status' not in req:
-                    req['status'] = response.status
-                    break
-
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=False,
@@ -224,7 +215,6 @@ class MajorPlayDownloader:
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             page.on('request', handle_request)
-            page.on('response', handle_response)
 
             # Navigate and interact
             page.goto(url, wait_until='load')
@@ -318,7 +308,6 @@ class MajorPlayDownloader:
 
                 # Remove site branding using regex (handles varying spaces/separators)
                 # Matches patterns like " / IDLIX", " - IDLIX", " | Streaming", etc.
-                import re
                 title = re.sub(r'\s*[/|–—\-]\s*idlix.*$', '', title, flags=re.IGNORECASE)
                 title = re.sub(r'\s*[/|–—\-]\s*streaming.*$', '', title, flags=re.IGNORECASE)
                 title = title.strip()
@@ -354,9 +343,8 @@ class MajorPlayDownloader:
                         network_subs_found += 1
 
             if network_subs_found > 0:
-                print(f"   [DEBUG] Found {network_subs_found} subtitle(s) from network capture (no language info)")
-
-            if self.subtitles:
+                print(f"   [OK] {network_subs_found} subtitle(s) from network capture")
+            elif self.subtitles:
                 print(f"   [OK] {len(self.subtitles)} subtitle(s) found")
 
             if not self.config_url:
@@ -613,7 +601,7 @@ class MajorPlayDownloader:
                 return None
         return None
 
-    def save_download_metadata(self, video_name, resolution, subtitle_info):
+    def save_download_metadata(self, video_name, resolution, subtitle_info, bandwidth=None):
         """Save download metadata for resume capability"""
         movie_dir = f"output/{video_name}"
         metadata_file = f"{movie_dir}/download_state.json"
@@ -624,6 +612,7 @@ class MajorPlayDownloader:
         metadata = {
             'video_name': video_name,
             'resolution': resolution,
+            'bandwidth': bandwidth,
             'subtitle': subtitle_info,
             'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         }
@@ -636,6 +625,8 @@ class MajorPlayDownloader:
 
     def get_language_from_subtitle_url(self, url):
         """Extract language name from subtitle URL path (e.g., /i18n/id/ -> Indonesian)"""
+        if not url:
+            return None
         match = re.search(r'/i18n/(\w+)/', url)
         if match:
             lang_code = match.group(1)
@@ -662,6 +653,46 @@ class MajorPlayDownloader:
             return lang_map.get(lang_code, lang_code.upper())
         return None
 
+    def format_subtitle_label(self, sub_info, index=None):
+        """Human-readable subtitle label. Handles playlist NAME/LANGUAGE and hash-only capture URLs."""
+        if not sub_info:
+            return 'none'
+
+        name = (sub_info.get('name') or '').strip()
+        language = sub_info.get('language')
+        url = sub_info.get('url', '')
+
+        # language may be a code ("id") or already a display name from metadata
+        lang_from_url = self.get_language_from_subtitle_url(url)
+        lang_map = {
+            'id': 'Indonesian', 'en': 'English', 'es': 'Spanish', 'pt': 'Portuguese',
+            'fr': 'French', 'de': 'German', 'zh': 'Chinese', 'ja': 'Japanese',
+            'ko': 'Korean', 'ar': 'Arabic', 'ru': 'Russian', 'it': 'Italian',
+            'nl': 'Dutch', 'pl': 'Polish', 'tr': 'Turkish', 'vi': 'Vietnamese',
+            'th': 'Thai',
+        }
+        if language:
+            lang_key = str(language).lower()
+            language_display = lang_map.get(lang_key, language)
+        else:
+            language_display = lang_from_url
+
+        # Hash-like capture filenames are not useful to show
+        is_hash = (
+            name
+            and name != 'Unknown'
+            and len(name) >= 16
+            and name.replace('-', '').replace('_', '').isalnum()
+        )
+        if is_hash or not name or name == 'Unknown':
+            if language_display:
+                return f"{language_display} Subtitle"
+            return f"Subtitle {index}" if index is not None else "Subtitle"
+
+        if language_display and language_display.lower() not in name.lower():
+            return f"{name} ({language_display})"
+        return name
+
     def download(self, url, config_url=None, auto_extract=True):
         """Main download flow"""
         self.config_url = config_url
@@ -685,10 +716,7 @@ class MajorPlayDownloader:
             elif not self.config_url:
                 print(f"[2/6] Config URL required (or use auto_extract mode)")
                 return False
-            else:
-                # Manual mode: skip network capture
-                if not self.get_session_media():
-                    return False
+            # Manual mode: config_url already set — skip network capture
 
             # Check for existing download to offer resume
             self.resume_mode = False
@@ -699,24 +727,20 @@ class MajorPlayDownloader:
                 if os.path.exists(segments_dir):
                     segment_count = len([f for f in os.listdir(segments_dir) if f.endswith('.m4s')])
                     print(f"\n[!] Previous download found:")
-                    print(f"   Resolution: {metadata.get('resolution', 'unknown')}")
-                    sub_info = metadata.get('subtitle')
-                    if sub_info:
-                        # Display subtitle with language parsing from URL
-                        if sub_info.get('language'):
-                            sub_display = f"{sub_info['name']} ({sub_info['language']})"
-                        elif sub_info.get('name') != 'Unknown' and len(sub_info.get('name', '')) >= 16 and sub_info.get('name', '').replace('-', '').replace('_', '').isalnum():
-                            # Hash-like filename - try to extract language from URL
-                            lang_from_url = self.get_language_from_subtitle_url(sub_info.get('url', ''))
-                            if lang_from_url:
-                                sub_display = f"{lang_from_url} Subtitle"
-                            else:
-                                sub_display = sub_info.get('name', 'Unknown')
-                        else:
-                            sub_display = sub_info.get('name', 'Unknown')
-                        print(f"   Subtitle: {sub_display}")
+                    res = metadata.get('resolution', 'unknown')
+                    bw = metadata.get('bandwidth')
+                    if res and res != 'unknown' and bw:
+                        quality_display = f"{res} ({bw // 1000} kbps)"
+                    elif bw:
+                        quality_display = f"{bw // 1000} kbps"
                     else:
-                        print(f"   Subtitle: none")
+                        quality_display = res or 'unknown'
+                    print(f"   Quality: {quality_display}")
+                    # Old state without bandwidth can't safely resume multi-unknown masters
+                    if bw is None and (not res or res == 'unknown'):
+                        print(f"   [!] Incomplete quality info (pre-bandwidth state) — choose Fresh (n)")
+                    sub_info = metadata.get('subtitle')
+                    print(f"   Subtitle: {self.format_subtitle_label(sub_info)}")
                     print(f"   Segments: {segment_count} files")
 
                     choice = None
@@ -736,6 +760,7 @@ class MajorPlayDownloader:
                     if choice == 'continue':
                         self.resume_mode = True
                         self.saved_resolution = metadata.get('resolution')
+                        self.saved_bandwidth = metadata.get('bandwidth')
                         self.saved_subtitle = metadata.get('subtitle')
                         print(f"   [OK] Resuming with saved settings")
                     elif choice == 'fresh':
@@ -761,17 +786,13 @@ class MajorPlayDownloader:
                 # Check if resuming with saved subtitle choice
                 if hasattr(self, 'resume_mode') and self.resume_mode and hasattr(self, 'saved_subtitle'):
                     if self.saved_subtitle is not None:
-                        # Try to find and auto-select saved subtitle
                         # Match by base URL (ignore JWT token in query params)
                         saved_base_url = self.saved_subtitle.get('url', '').split('?')[0]
                         for sub_info in self.subtitles:
                             sub_base_url = sub_info['url'].split('?')[0]
                             if sub_base_url == saved_base_url:
-                                subtitle_url = sub_info['url']  # Use fresh URL with new JWT
-                                sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else 'Subtitle'
-                                if sub_info['language']:
-                                    sub_display = f"{sub_display} ({sub_info['language']})"
-                                print(f"[4/6] Using saved subtitle: {sub_display}")
+                                subtitle_url = sub_info['url']  # fresh URL with new JWT
+                                print(f"[4/6] Using saved subtitle: {self.format_subtitle_label(sub_info)}")
                                 subtitle_handled_by_resume = True
                                 break
                         if not subtitle_handled_by_resume:
@@ -783,25 +804,8 @@ class MajorPlayDownloader:
 
                 # Prompt for subtitle selection if not handled by resume mode
                 if not subtitle_handled_by_resume and len(self.subtitles) == 1:
-                    # Single subtitle - simple yes/no
-                    # Show language name instead of hash filename
                     sub_info = self.subtitles[0]
-                    print(f"   [DEBUG] Subtitle info: name='{sub_info['name']}', language={sub_info['language']}, name_len={len(sub_info['name'])}")
-                    # Use friendly name for fallback subtitles (from network capture without language info)
-                    if sub_info['language']:
-                        sub_display = f"{sub_info['name']} ({sub_info['language']})"
-                    elif sub_info['name'] != 'Unknown' and len(sub_info['name']) >= 16 and sub_info['name'].replace('-', '').replace('_', '').isalnum():
-                        # Hash-like filename - try to extract language from URL
-                        lang_from_url = self.get_language_from_subtitle_url(sub_info['url'])
-                        if lang_from_url:
-                            print(f"   [DEBUG] Detected hash-like filename, parsed language from URL: {lang_from_url}")
-                            sub_display = f"{lang_from_url} Subtitle"
-                        else:
-                            print(f"   [DEBUG] Detected hash-like filename, no language in URL")
-                            sub_display = "Subtitle"
-                    else:
-                        sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else 'Subtitle'
-                    print(f"[4/6] Subtitle found: {sub_display}")
+                    print(f"[4/6] Subtitle found: {self.format_subtitle_label(sub_info)}")
                     include_subtitle = None
                     while include_subtitle is None:
                         try:
@@ -821,23 +825,10 @@ class MajorPlayDownloader:
                     else:
                         print("   Subtitle skipped")
                 elif not subtitle_handled_by_resume:
-                    # Multiple subtitles - numbered list selection
                     print(f"[4/6] {len(self.subtitles)} subtitles found")
                     print("\n   Available subtitles:")
                     for i, sub_info in enumerate(self.subtitles):
-                        # Show language name instead of hash filename
-                        if sub_info['language']:
-                            sub_display = f"{sub_info['name']} ({sub_info['language']})"
-                        elif sub_info['name'] != 'Unknown' and len(sub_info['name']) >= 16 and sub_info['name'].replace('-', '').replace('_', '').isalnum():
-                            # Hash-like filename - try to extract language from URL
-                            lang_from_url = self.get_language_from_subtitle_url(sub_info['url'])
-                            if lang_from_url:
-                                sub_display = f"{lang_from_url} Subtitle"
-                            else:
-                                sub_display = f"Subtitle {i+1}"
-                        else:
-                            sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else f"Subtitle {i+1}"
-                        print(f"   {i+1}. {sub_display}")
+                        print(f"   {i+1}. {self.format_subtitle_label(sub_info, index=i + 1)}")
 
                     selected = None
                     while selected is None:
@@ -864,11 +855,7 @@ class MajorPlayDownloader:
                     else:
                         sub_info = self.subtitles[selected]
                         subtitle_url = sub_info['url']
-                        # Show selected subtitle name
-                        sub_display = sub_info['name'] if sub_info['name'] != 'Unknown' else f"Subtitle {selected + 1}"
-                        if sub_info['language']:
-                            sub_display = f"{sub_display} ({sub_info['language']})"
-                        print(f"   Selected: {sub_display}")
+                        print(f"   Selected: {self.format_subtitle_label(sub_info, index=selected + 1)}")
 
             # Save metadata for resume capability (only in normal mode, not resume mode)
             if not hasattr(self, 'resume_mode') or not self.resume_mode:
@@ -884,7 +871,12 @@ class MajorPlayDownloader:
                                 if lang_from_url:
                                     subtitle_info['language'] = lang_from_url
                             break
-                self.save_download_metadata(self.video_name, self.selected_resolution, subtitle_info)
+                self.save_download_metadata(
+                    self.video_name,
+                    self.selected_resolution,
+                    subtitle_info,
+                    getattr(self, 'selected_bandwidth', None),
+                )
 
             # Step 5/6: Download
             movie_dir = f"output/{self.video_name}"

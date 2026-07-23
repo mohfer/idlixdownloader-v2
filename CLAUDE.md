@@ -18,73 +18,66 @@ uv run idlix <video_url> <config_url>         # Manual mode: skip capture, use k
 
 **Test:**
 ```bash
-uv run python tests/test_downloader.py   # Run unit tests for downloader
+uv run python tests/test_downloader.py                          # Full unit suite (unittest)
+uv run python tests/test_downloader.py TestParseNetworkCapture  # One test class
+uv run python -m unittest tests.test_downloader.TestLanguageParsing.test_parse_language_english  # Single test
 ```
 
-**Requirements:**
-- FFmpeg must be installed and in PATH (run `ffmpeg -version` to verify)
-- Python ≥ 3.13
+No linter/formatter is configured. Dependencies: `cloudscraper`, `playwright`. Python ≥ 3.13. FFmpeg must be on PATH (`ffmpeg -version`).
 
 ## Architecture
 
-### Three-Phase Pipeline
+Single class owns the pipeline: `MajorPlayDownloader` in `src/idlixdownloader/downloader.py`. CLI is `idlix` → `__main__.main()` → `downloader.main()`.
 
-1. **Network Capture** (`_capture_network_traffic`, `capture_network`)
-   - Playwright browser automation with Cloudflare bypass (stealth user agent, webdriver flag removal)
-   - Automates play button clicks, closes popup ad tabs, auto-skips pre-roll ads after 8 seconds
-   - **Early exit optimization**: polls every 3s for config URL, exits when found (typically 10-20s vs 60s fixed wait)
-   - Captures all network requests to extract config URL and subtitle URL
+### Pipeline (`download`)
 
-2. **Playlist Parsing** (`parse_network_capture`, `get_config_playlist`)
-   - Extracts JWT token from config URL (~55 minute validity - must be preserved throughout)
-   - Parses M3U8 master playlist (disguised as `.json`) to get video/audio variant playlists
-   - Interactive prompts for resolution selection (defaults to highest) and subtitle inclusion
+1. **Metadata** (`get_video_info`) — scrape page for title (slug fallback).
+2. **Config discovery**
+   - Auto: Playwright capture (`capture_network` / `_capture_network_traffic`) → `parse_network_capture`
+   - Manual: caller supplies config URL; skip browser capture
+3. **Resume check** — if `output/<title>/download_state.json` + `segments/` exist, prompt continue vs fresh.
+4. **Playlist** (`get_config_playlist`) — fetch disguised M3U8 master; pick quality by bandwidth (or reuse saved); collect audio + subtitles. Highest = max bandwidth, not list index 1.
+5. **Subtitle choice** — interactive, or restored from metadata by base URL (JWT query stripped). Labels via `format_subtitle_label` (playlist NAME/LANGUAGE, `/i18n/<code>/`, or generic `Subtitle`).
+6. **Download + mux** (`download_segments` → `download_with_ffmpeg`) — parallel fMP4 segments, binary concat, FFmpeg → MKV.
 
-3. **Parallel Download** (`download_segments`, `download_with_ffmpeg`)
-   - 5 worker threads, 3 retry attempts per segment
-   - Downloads fMP4 init segment + all fragments
-   - **Binary concatenation**: `init_segment + frag1 + frag2 + ... = complete.mp4` (not FFmpeg concat)
-   - FFmpeg muxes video + audio + subtitles into final MKV container
+### Network capture
 
-### MajorPlay Obfuscation
+- Visible Chromium (`headless=False`), stealth UA + `navigator.webdriver` stripped.
+- Auto-clicks play, closes popup tabs, skips pre-roll after ~8s.
+- Early exit: poll every 3s for `majorplay.net` + `config-` + `.json` (often 10–20s vs full wait).
+- Capture budget in auto mode is 70s wall clock.
 
-MajorPlay uses standard HLS with disguises:
-- M3U8 master playlists disguised as `.json` files
-- fMP4 video segments disguised as common extensions (`.js`, `.png`, `.jpg`, `.css`, `.svg`, `.html`)
-- Content distributed across 6+ CDN domains
-- JWT authentication tokens (~55 min expiration) appended as query parameters
-- Pre-roll VAST ads must be skipped before content plays
+### Resume / metadata
 
-### Key Design Decisions
+- State file: `output/<video_name>/download_state.json` (`resolution`, `bandwidth`, `subtitle` dict, timestamp).
+- Resume matches quality by **bandwidth** (MajorPlay often omits `RESOLUTION=`, so label collides as `unknown`). Legacy state without bandwidth + unknown resolution cannot auto-match — prompt / prefer Fresh.
+- Helpers: `save_download_metadata`, `load_download_metadata`, `get_language_from_subtitle_url` (`/i18n/<code>/` → display name), `format_subtitle_label`.
+- Resume keeps quality/subtitle prefs; segment download skips existing `.m4s`. Fresh mode deletes segments + state.
+- Subtitle rematch ignores JWT query so resume survives token expiry; capture must still produce a fresh config URL/token for new segment fetches.
+- Different qualities ⇒ different segment counts; wrong-quality resume can mix partial segments — prefer Fresh if match is ambiguous.
 
-**Why Playwright + cloudscraper combo?**
-- Playwright: bypasses Cloudflare, captures network traffic, automates browser interactions
-- cloudscraper: handles authenticated segment downloads with preserved JWT tokens
+### MajorPlay obfuscation
 
-**Why binary concatenation instead of FFmpeg concat demuxer?**
-- fMP4 fragments are already in the correct format (init + fragments = valid MP4)
-- Direct binary concat is faster and simpler than FFmpeg's concat protocol
+Standard HLS, disguised:
+- Master playlist as `.json`; fMP4 fragments as `.js`/`.png`/`.jpg`/`.css`/`.svg`/`.html`
+- Multi-CDN; JWT on query (~55 min lifetime) must stay on every authenticated URL
+- Pre-roll VAST must be skipped before config appears
 
-**Why visible browser (headless=False)?**
-- More reliable for Cloudflare bypass
-- User can see what's happening during the ~10-20s capture phase
+### Design choices worth preserving
 
-## File Structure
+- **Playwright + cloudscraper**: browser for CF + interaction/capture; cloudscraper for authenticated segment GETs with JWT intact.
+- **Binary concat, not FFmpeg concat demuxer**: `init + frags` is already valid fMP4; faster path.
+- **Visible browser**: more reliable CF bypass than headless.
 
-- `src/idlixdownloader/downloader.py` - Single-class implementation (`MajorPlayDownloader`)
-- `src/idlixdownloader/__main__.py` - CLI entry point (delegates to `downloader.main()`)
-- `output/` - Downloaded videos (gitignored)
+### Layout
 
-## Debugging
+- `src/idlixdownloader/downloader.py` — all download logic
+- `src/idlixdownloader/__main__.py` — CLI entry
+- `tests/test_downloader.py` — unittest (parse, playlist, video info, metadata, language, subtitle labels, bandwidth resume)
+- `output/` — downloads (gitignored); per-title dirs hold `segments/`, `download_state.json`, final `.mkv`
 
-**Config URL not found:**
-- Video must play past the ad - ensure ad skip button clicked after 8s
-- Check if config URL appears in captured requests (look for `majorplay.net` + `config-` + `.json`)
+### Debug
 
-**JWT token expired (HTTP 403 on segments):**
-- Tokens last ~55 minutes from capture time
-- Re-run full capture to get fresh token (don't reuse old config URLs)
-
-**Segments fail to download:**
-- Retry logic handles transient network issues (3 attempts per segment)
-- CDN issues are temporary - wait and retry full download if many segments fail
+- **No config URL**: video never got past ad; look for `majorplay.net` + `config-` + `.json` in capture.
+- **HTTP 403 on segments**: JWT expired → re-capture; do not reuse stale config URLs for long runs.
+- **Many segment failures**: 3 retries/segment already; wait and re-run if CDN is flaky.

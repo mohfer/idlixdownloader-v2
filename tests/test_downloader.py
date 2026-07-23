@@ -233,6 +233,51 @@ video-1080p.m3u8
         result = self.downloader.get_config_playlist()
         self.assertFalse(result)
 
+    def test_resume_matches_by_bandwidth_when_resolution_unknown(self):
+        """Resume must pick by bandwidth; all-unknown RESOLUTION collides otherwise"""
+        self.downloader.resume_mode = True
+        self.downloader.saved_resolution = 'unknown'
+        self.downloader.saved_bandwidth = 5800000
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.text = '''#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=700000
+video-low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3500000
+video-mid.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5800000
+video-high.m3u8
+'''
+
+        with patch.object(self.downloader.scraper, 'get', return_value=mock_response):
+            result = self.downloader.get_config_playlist()
+            self.assertTrue(result)
+            self.assertIn('video-high', self.downloader.video_playlist_url)
+            self.assertEqual(self.downloader.selected_bandwidth, 5800000)
+
+    def test_resume_legacy_unknown_without_bandwidth_prompts(self):
+        """Legacy state with only resolution=unknown cannot safely auto-match"""
+        self.downloader.resume_mode = True
+        self.downloader.saved_resolution = 'unknown'
+        self.downloader.saved_bandwidth = None
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.text = '''#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=700000
+video-low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5800000
+video-high.m3u8
+'''
+
+        with patch('idlixdownloader.downloader.input', return_value='') as mock_input:
+            with patch.object(self.downloader.scraper, 'get', return_value=mock_response):
+                result = self.downloader.get_config_playlist()
+                self.assertTrue(result)
+                mock_input.assert_called()
+                self.assertIn('video-high', self.downloader.video_playlist_url)
+
 
 class TestVideoInfo(unittest.TestCase):
     """Test video info extraction"""
@@ -240,8 +285,8 @@ class TestVideoInfo(unittest.TestCase):
     def setUp(self):
         self.downloader = MajorPlayDownloader()
 
-    def test_extract_video_id_and_title(self):
-        """Test video ID and title extraction"""
+    def test_extract_title(self):
+        """Test title extraction from meta tag"""
         mock_response = Mock()
         mock_response.status_code = 200
         mock_response.text = '<div data-postid="12345">Content</div><meta itemprop="name" content="Test Movie">'
@@ -249,20 +294,7 @@ class TestVideoInfo(unittest.TestCase):
         with patch.object(self.downloader.scraper, 'get', return_value=mock_response):
             result = self.downloader.get_video_info('https://z2.idlixku.com/movie/test')
             self.assertTrue(result)
-            self.assertEqual(self.downloader.video_id, '12345')
             self.assertEqual(self.downloader.video_name, 'Test Movie')
-
-    def test_extract_title_only(self):
-        """Test title extraction when ID not found"""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.text = '<meta itemprop="name" content="Awesome Movie">'
-
-        with patch.object(self.downloader.scraper, 'get', return_value=mock_response):
-            result = self.downloader.get_video_info('https://z2.idlixku.com/movie/test')
-            self.assertTrue(result)
-            self.assertEqual(self.downloader.video_name, 'Awesome Movie')
-            self.assertIsNone(self.downloader.video_id)
 
     def test_fallback_to_url_slug(self):
         """Test fallback to URL slug when title not found"""
@@ -331,12 +363,15 @@ class TestMetadataSystem(unittest.TestCase):
                     'language': 'en'
                 }
 
-                self.downloader.save_download_metadata("Test Movie", "1920x1080", subtitle_info)
+                self.downloader.save_download_metadata(
+                    "Test Movie", "1920x1080", subtitle_info, bandwidth=5000000
+                )
                 loaded = self.downloader.load_download_metadata("Test Movie")
 
                 self.assertIsNotNone(loaded)
                 self.assertEqual(loaded['video_name'], "Test Movie")
                 self.assertEqual(loaded['resolution'], "1920x1080")
+                self.assertEqual(loaded['bandwidth'], 5000000)
                 self.assertEqual(loaded['subtitle']['language'], 'en')
             finally:
                 os.chdir(original_cwd)
@@ -371,6 +406,41 @@ class TestLanguageParsing(unittest.TestCase):
         url = "https://example.com/subtitle.vtt"
         result = self.downloader.get_language_from_subtitle_url(url)
         self.assertIsNone(result)
+
+    def test_format_playlist_name_and_language(self):
+        label = self.downloader.format_subtitle_label({
+            'name': 'Bahasa Indonesia',
+            'language': 'id',
+            'url': 'https://e2e.majorplay.net/subs.vtt',
+        })
+        self.assertEqual(label, 'Bahasa Indonesia (Indonesian)')
+
+    def test_format_hash_with_i18n_url(self):
+        label = self.downloader.format_subtitle_label({
+            'name': 'd0690e6eec95a54d285545da878c41af',
+            'language': None,
+            'url': 'https://e2e.majorplay.net/v/x/i18n/en/subtitle.vtt?t=tok',
+        })
+        self.assertEqual(label, 'English Subtitle')
+
+    def test_format_hash_without_language(self):
+        label = self.downloader.format_subtitle_label({
+            'name': 'd0690e6eec95a54d285545da878c41af',
+            'language': None,
+            'url': 'https://e2e.majorplay.net/subs-legacy/d0690e6eec95a54d285545da878c41af.vtt',
+        })
+        self.assertEqual(label, 'Subtitle')
+
+    def test_format_hash_without_language_indexed(self):
+        label = self.downloader.format_subtitle_label({
+            'name': 'd0690e6eec95a54d285545da878c41af',
+            'language': None,
+            'url': 'https://e2e.majorplay.net/subs-legacy/hash.vtt',
+        }, index=2)
+        self.assertEqual(label, 'Subtitle 2')
+
+    def test_format_none_subtitle(self):
+        self.assertEqual(self.downloader.format_subtitle_label(None), 'none')
 
 
 if __name__ == '__main__':
