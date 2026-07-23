@@ -7,14 +7,15 @@ Video downloader for [IDLIX](https://z2.idlixku.com) with automated network capt
 - **Automated Network Capture** - Playwright-based browser automation with stealth techniques to bypass Cloudflare challenges
 - **Smart Interaction** - Auto-detects and clicks play buttons, handles popup ads, and automatically skips pre-roll advertisements
 - **Early Exit Optimization** - Polls for config URLs and exits early instead of waiting fixed timeouts (reduces capture time from 60s to ~10-20s)
-- **Resume Download Capability** - Save download state (resolution, subtitle, progress) and resume interrupted downloads
+- **Resume Download Capability** - Saves quality (bandwidth), subtitle choice, and segment progress; resumes interrupted downloads
 - **Smart Resume Mode** - Auto-detects previous downloads and offers to continue with saved settings or start fresh
-- **Language Detection** - Automatically parses subtitle language from URL (Indonesian, English, etc.)
+- **Quality Matching by Bandwidth** - Resume matches the selected stream by bandwidth (works when MajorPlay omits `RESOLUTION=` and only reports kbps)
+- **Language Detection** - Parses subtitle language from playlist metadata or `/i18n/<code>/` URL paths when available
 - **JWT Token Resilience** - Resume works even after JWT token expires (~55 minutes) by matching subtitles by base URL
 - **Parallel Downloading** - Multi-threaded segment download (5 workers) with automatic retry logic (3 attempts per segment)
-- **Interactive Selection** - User prompts for resolution and subtitle preferences during download
+- **Interactive Selection** - Prompts for quality and subtitle preferences during download
 - **Proper fMP4 Assembly** - Handles init segments correctly for fragmented MP4 concatenation
-- **Subtitle Support** - Auto-detects and embeds subtitles (Indonesian, English) into MKV output
+- **Subtitle Support** - Auto-detects and embeds subtitles into MKV output
 
 ## Prerequisites
 
@@ -57,10 +58,10 @@ uv run idlix "https://z2.idlixku.com/movie/toy-story-5-2026"
 5. Tool automatically clicks Skip Ad button after 8 seconds (if detected)
 6. Captures network traffic (~70 seconds or until config URL found)
 7. Extracts config and subtitle URLs from captured requests
-8. Prompts for resolution selection (defaults to highest quality)
+8. Prompts for quality selection (defaults to highest bandwidth)
 9. Prompts for subtitle inclusion (defaults to yes)
 10. Downloads all segments in parallel (time varies by connection speed and server load)
-11. Outputs: `output/Movie Title.mkv` with embedded subtitles
+11. Outputs: `output/Movie Title/Movie Title.mkv` with embedded subtitles
 
 ### Manual Mode
 
@@ -72,24 +73,48 @@ uv run idlix "https://z2.idlixku.com/movie/..." "https://e2e.majorplay.net/.../c
 
 This skips the browser automation step and goes directly to downloading.
 
+### Quality selection
+
+MajorPlay master playlists sometimes include resolution, sometimes only bandwidth:
+
+```
+Available qualities:
+1. 1920x1080 (5836 kbps)
+2. 1280x720 (2694 kbps)
+```
+
+or:
+
+```
+Available qualities:
+1. 700 kbps
+2. 3500 kbps
+3. 5800 kbps
+```
+
+Enter (empty) always picks the **highest bandwidth**, not necessarily list item 1.
+
 ### Resume Download
 
 If a download is interrupted, the tool automatically detects the previous download and offers to resume:
 
 ```
 [!] Previous download found:
-   Resolution: 1920x1080
-   Subtitle: Indonesian Subtitle
+   Quality: 5800 kbps
+   Subtitle: Subtitle
    Segments: 358 files
 
    Continue previous download? (Y/n):
 ```
 
-**Continue (Y)**: Resumes with saved settings (resolution and subtitle choice), skips already-downloaded segments
+**Continue (Y)**: Resumes with saved settings (quality + subtitle), skips already-downloaded segments
 
 **Fresh (n)**: Deletes old segments and metadata, starts a fresh download with new selections
 
-**Note**: Resume works even if JWT tokens have expired (>55 minutes) because the tool captures fresh tokens while matching saved subtitle preferences by base URL.
+**Notes:**
+- Resume matches quality by **bandwidth** (not the display string alone). This avoids mixing streams when several variants are labeled without resolution.
+- Resume works even if JWT tokens have expired (>55 minutes): a new capture refreshes tokens while subtitle prefs match by base URL.
+- Older state files that only stored `resolution: "unknown"` (no bandwidth) cannot safely auto-match — choose **Fresh**, or re-select quality when prompted.
 
 ## How It Works
 
@@ -142,6 +167,11 @@ idlixdownloader-v2/
 - Tokens last approximately 55 minutes
 - If download takes longer, capture again to get a fresh token
 - Manual mode will fail with expired tokens
+
+**Resume picked a different quality / segment count changed**
+- Different qualities have different segment counts — that is normal
+- Resume must match the same bandwidth; if state is incomplete (`unknown` without bandwidth), use Fresh
+- Do not continue a partial download after a wrong-quality resume; start Fresh
 
 **FFmpeg not found**
 - Install FFmpeg and ensure it's in your system PATH
